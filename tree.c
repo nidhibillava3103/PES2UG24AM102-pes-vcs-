@@ -1,137 +1,201 @@
-// tree.c — Tree object serialization and construction
+// commit.c — Commit creation and history traversal
 //
-// PROVIDED functions: get_file_mode, tree_parse, tree_serialize
-// TODO functions:     tree_from_index
+// Commit object format (stored as text, one field per line):
 //
-// Binary tree format (per entry, concatenated with no separators):
-//   "<mode-as-ascii-octal> <name>\0<32-byte-binary-hash>"
+//   tree <64-char-hex-hash>
+//   parent <64-char-hex-hash>        ← omitted for the first commit
+//   author <name> <unix-timestamp>
+//   committer <name> <unix-timestamp>
 //
-// Example single entry (conceptual):
-//   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
+//   <commit message>
+//
+// Note: there is a blank line between the headers and the message.
+//
+// PROVIDED functions: commit_parse, commit_serialize, commit_walk, head_read, head_update
+// TODO functions:     commit_create
 
+#include "commit.h"
+#include "index.h"
 #include "tree.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <dirent.h>
-#include <sys/stat.h>
+#include <inttypes.h>
+#include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
 
-// ─── Mode Constants ─────────────────────────────────────────────────────────
+// Forward declarations (implemented in object.c)
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+int object_read(const ObjectID *id, ObjectType *type_out, void **data_out, size_t *len_out);
 
-#define MODE_FILE      0100644
-#define MODE_EXEC      0100755
-#define MODE_DIR       0040000
+// ─── PROVIDED ────────────────────────────────────────────────────────────────
 
-// ─── PROVIDED ───────────────────────────────────────────────────────────────
+// Parse raw commit data into a Commit struct.
+int commit_parse(const void *data, size_t len, Commit *commit_out) {
+    (void)len;
+    const char *p = (const char *)data;
+    char hex[HASH_HEX_SIZE + 1];
 
-// Determine the object mode for a filesystem path.
-uint32_t get_file_mode(const char *path) {
-    struct stat st;
-    if (lstat(path, &st) != 0) return 0;
+    // "tree <hex>\n"
+    if (sscanf(p, "tree %64s\n", hex) != 1) return -1;
+    if (hex_to_hash(hex, &commit_out->tree) != 0) return -1;
+    p = strchr(p, '\n') + 1;
 
-    if (S_ISDIR(st.st_mode))  return MODE_DIR;
-    if (st.st_mode & S_IXUSR) return MODE_EXEC;
-    return MODE_FILE;
-}
-
-// Parse binary tree data into a Tree struct safely.
-// Returns 0 on success, -1 on parse error.
-int tree_parse(const void *data, size_t len, Tree *tree_out) {
-    tree_out->count = 0;
-    const uint8_t *ptr = (const uint8_t *)data;
-    const uint8_t *end = ptr + len;
-
-    while (ptr < end && tree_out->count < MAX_TREE_ENTRIES) {
-        TreeEntry *entry = &tree_out->entries[tree_out->count];
-
-        // 1. Safely find the space character for the mode
-        const uint8_t *space = memchr(ptr, ' ', end - ptr);
-        if (!space) return -1; // Malformed data
-
-        // Parse mode into an isolated buffer
-        char mode_str[16] = {0};
-        size_t mode_len = space - ptr;
-        if (mode_len >= sizeof(mode_str)) return -1;
-        memcpy(mode_str, ptr, mode_len);
-        entry->mode = strtol(mode_str, NULL, 8);
-
-        ptr = space + 1; // Skip space
-
-        // 2. Safely find the null terminator for the name
-        const uint8_t *null_byte = memchr(ptr, '\0', end - ptr);
-        if (!null_byte) return -1; // Malformed data
-
-        size_t name_len = null_byte - ptr;
-        if (name_len >= sizeof(entry->name)) return -1;
-        memcpy(entry->name, ptr, name_len);
-        entry->name[name_len] = '\0'; // Ensure null-terminated
-
-        ptr = null_byte + 1; // Skip null byte
-
-        // 3. Read the 32-byte binary hash
-        if (ptr + HASH_SIZE > end) return -1; 
-        memcpy(entry->hash.hash, ptr, HASH_SIZE);
-        ptr += HASH_SIZE;
-
-        tree_out->count++;
+    // optional "parent <hex>\n"
+    if (strncmp(p, "parent ", 7) == 0) {
+        if (sscanf(p, "parent %64s\n", hex) != 1) return -1;
+        if (hex_to_hash(hex, &commit_out->parent) != 0) return -1;
+        commit_out->has_parent = 1;
+        p = strchr(p, '\n') + 1;
+    } else {
+        commit_out->has_parent = 0;
     }
+
+    // "author <name> <timestamp>\n"
+    char author_buf[256];
+    uint64_t ts;
+    if (sscanf(p, "author %255[^\n]\n", author_buf) != 1) return -1;
+    // split off trailing timestamp
+    char *last_space = strrchr(author_buf, ' ');
+    if (!last_space) return -1;
+    ts = (uint64_t)strtoull(last_space + 1, NULL, 10);
+    *last_space = '\0';
+    snprintf(commit_out->author, sizeof(commit_out->author), "%s", author_buf);
+    commit_out->timestamp = ts;
+    p = strchr(p, '\n') + 1;  // skip author line
+    p = strchr(p, '\n') + 1;  // skip committer line
+    p = strchr(p, '\n') + 1;  // skip blank line
+
+    snprintf(commit_out->message, sizeof(commit_out->message), "%s", p);
     return 0;
 }
 
-// Helper for qsort to ensure consistent tree hashing
-static int compare_tree_entries(const void *a, const void *b) {
-    return strcmp(((const TreeEntry *)a)->name, ((const TreeEntry *)b)->name);
-}
-
-// Serialize a Tree struct into binary format for storage.
+// Serialize a Commit struct to the text format.
 // Caller must free(*data_out).
-// Returns 0 on success, -1 on error.
-int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
-    // Estimate max size: (6 bytes mode + 1 byte space + 256 bytes name + 1 byte null + 32 bytes hash) per entry
-    size_t max_size = tree->count * 296; 
-    uint8_t *buffer = malloc(max_size);
-    if (!buffer) return -1;
+int commit_serialize(const Commit *commit, void **data_out, size_t *len_out) {
+    char tree_hex[HASH_HEX_SIZE + 1];
+    char parent_hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(&commit->tree, tree_hex);
 
-    // Create a mutable copy to sort entries (Git requirement)
-    Tree sorted_tree = *tree;
-    qsort(sorted_tree.entries, sorted_tree.count, sizeof(TreeEntry), compare_tree_entries);
-
-    size_t offset = 0;
-    for (int i = 0; i < sorted_tree.count; i++) {
-        const TreeEntry *entry = &sorted_tree.entries[i];
-        
-        // Write mode and name (%o writes octal correctly for Git standards)
-        int written = sprintf((char *)buffer + offset, "%o %s", entry->mode, entry->name);
-        offset += written + 1; // +1 to step over the null terminator written by sprintf
-        
-        // Write binary hash
-        memcpy(buffer + offset, entry->hash.hash, HASH_SIZE);
-        offset += HASH_SIZE;
+    char buf[8192];
+    int n = 0;
+    n += snprintf(buf + n, sizeof(buf) - n, "tree %s\n", tree_hex);
+    if (commit->has_parent) {
+        hash_to_hex(&commit->parent, parent_hex);
+        n += snprintf(buf + n, sizeof(buf) - n, "parent %s\n", parent_hex);
     }
+    n += snprintf(buf + n, sizeof(buf) - n,
+                  "author %s %" PRIu64 "\n"
+                  "committer %s %" PRIu64 "\n"
+                  "\n"
+                  "%s",
+                  commit->author, commit->timestamp,
+                  commit->author, commit->timestamp,
+                  commit->message);
 
-    *data_out = buffer;
-    *len_out = offset;
+    *data_out = malloc(n + 1);
+    if (!*data_out) return -1;
+    memcpy(*data_out, buf, n + 1);
+    *len_out = (size_t)n;
     return 0;
 }
 
-// ─── TODO: Implement these ──────────────────────────────────────────────────
+// Walk commit history from HEAD to the root.
+int commit_walk(commit_walk_fn callback, void *ctx) {
+    ObjectID id;
+    if (head_read(&id) != 0) return -1;
 
-// Build a tree hierarchy from the current index and write all tree
-// objects to the object store.
+    while (1) {
+        ObjectType type;
+        void *raw;
+        size_t raw_len;
+        if (object_read(&id, &type, &raw, &raw_len) != 0) return -1;
+
+        Commit c;
+        int rc = commit_parse(raw, raw_len, &c);
+        free(raw);
+        if (rc != 0) return -1;
+
+        callback(&id, &c, ctx);
+
+        if (!c.has_parent) break;
+        id = c.parent;
+    }
+    return 0;
+}
+
+// Read the current HEAD commit hash.
+int head_read(ObjectID *id_out) {
+    FILE *f = fopen(HEAD_FILE, "r");
+    if (!f) return -1;
+    char line[512];
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
+    fclose(f);
+    line[strcspn(line, "\r\n")] = '\0'; // strip newline
+
+    char ref_path[512];
+    if (strncmp(line, "ref: ", 5) == 0) {
+        snprintf(ref_path, sizeof(ref_path), "%s/%s", PES_DIR, line + 5);
+        f = fopen(ref_path, "r");
+        if (!f) return -1; // Branch exists but has no commits yet
+        if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
+        fclose(f);
+        line[strcspn(line, "\r\n")] = '\0';
+    }
+    return hex_to_hash(line, id_out);
+}
+
+// Update the current branch ref to point to a new commit atomically.
+int head_update(const ObjectID *new_commit) {
+    FILE *f = fopen(HEAD_FILE, "r");
+    if (!f) return -1;
+    char line[512];
+    if (!fgets(line, sizeof(line), f)) { fclose(f); return -1; }
+    fclose(f);
+    line[strcspn(line, "\r\n")] = '\0';
+
+    char target_path[520];
+    if (strncmp(line, "ref: ", 5) == 0) {
+        snprintf(target_path, sizeof(target_path), "%s/%s", PES_DIR, line + 5);
+    } else {
+        snprintf(target_path, sizeof(target_path), "%s", HEAD_FILE); // Detached HEAD
+    }
+
+    char tmp_path[528];
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", target_path);
+    
+    f = fopen(tmp_path, "w");
+    if (!f) return -1;
+    
+    char hex[HASH_HEX_SIZE + 1];
+    hash_to_hex(new_commit, hex);
+    fprintf(f, "%s\n", hex);
+    
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    
+    return rename(tmp_path, target_path);
+}
+
+// ─── TODO: Implement these ───────────────────────────────────────────────────
+
+// Create a new commit from the current staging area.
 //
-// HINTS - Useful functions and concepts for this phase:
-//   - index_load      : load the staged files into memory
-//   - strchr          : find the first '/' in a path to separate directories from files
-//   - strncmp         : compare prefixes to group files belonging to the same subdirectory
-//   - Recursion       : you will likely want to create a recursive helper function 
-//                       (e.g., `write_tree_level(entries, count, depth)`) to handle nested dirs.
-//   - tree_serialize  : convert your populated Tree struct into a binary buffer
-//   - object_write    : save that binary buffer to the store as OBJ_TREE
+// HINTS - Useful functions to call:
+//   - tree_from_index   : writes the directory tree and gets the root hash
+//   - head_read         : gets the parent commit hash (if any)
+//   - pes_author        : retrieves the author name string (from pes.h)
+//   - time(NULL)        : gets the current unix timestamp
+//   - commit_serialize  : converts the filled Commit struct to a text buffer
+//   - object_write      : saves the serialized text as OBJ_COMMIT
+//   - head_update       : moves the branch pointer to your new commit
 //
 // Returns 0 on success, -1 on error.
-int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
+int commit_create(const char *message, ObjectID *commit_id_out) {
+    // TODO: Implement commit creation
     // (See Lab Appendix for logical steps)
-    (void)id_out;
+    (void)message; (void)commit_id_out;
     return -1;
 }
